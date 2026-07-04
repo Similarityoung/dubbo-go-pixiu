@@ -138,9 +138,7 @@ clusterName
 
 ### Migration from `dubboProxyConfig.auto_resolve`
 
-`dubboProxyConfig.auto_resolve` is no longer supported. If this field is present
-under `dgp.filter.http.dubboproxy`, Pixiu rejects the configuration during filter
-initialization.
+`dubboProxyConfig.auto_resolve` is no longer part of Pixiu's Dubbo proxy config.
 
 Remove the legacy field:
 

@@ -77,7 +77,6 @@ func TestResolveFromOutboundDirectMode(t *testing.T) {
 	dc := NewDubboClient()
 	dc.SetConfig(&DubboProxyConfig{
 		LoadBalance: "roundrobin",
-		Retries:     "5",
 		Timeout: &model.TimeoutConfig{
 			RequestTimeoutStr: "4s",
 		},
@@ -92,29 +91,21 @@ func TestResolveFromOutboundDirectMode(t *testing.T) {
 		Serialization: "hessian2",
 	})
 
-	assert.Equal(t, "direct", spec.Mode)
 	assert.Equal(t, "com.example.UserService", spec.Interface)
 	assert.Equal(t, "gray", spec.Group)
 	assert.Equal(t, "1.0.0", spec.Version)
 	assert.Equal(t, "dubbo://127.0.0.1:20880", spec.URL)
-	assert.Equal(t, "dubbo", spec.EffectiveProtocol)
-	assert.Equal(t, "hessian2", spec.EffectiveSerialization)
-	assert.Empty(t, spec.RegistryIDs)
-	assert.False(t, spec.UseNacosWarmup)
-	assert.Equal(t, "failover", spec.ConsumerDefaults.Cluster)
+	assert.Equal(t, "dubbo", spec.Protocol)
+	assert.Equal(t, "hessian2", spec.Serialization)
+	assert.Equal(t, "failfast", spec.ConsumerDefaults.Cluster)
 	assert.Equal(t, "roundrobin", spec.ConsumerDefaults.LoadBalance)
-	assert.Equal(t, "5", spec.ConsumerDefaults.Retries)
 	assert.Equal(t, 4*time.Second, spec.ConsumerDefaults.RequestTimeout)
 }
 
-func TestResolveFromOutboundRegistryMode(t *testing.T) {
+func TestResolveFromOutboundRequiresDirectAddress(t *testing.T) {
 	dc := NewDubboClient()
 	dc.SetConfig(&DubboProxyConfig{
 		Registries: map[string]model.Registry{
-			"zk": {
-				Protocol: "zookeeper",
-				Address:  "127.0.0.1:2181",
-			},
 			"nacos-main": {
 				Protocol: "nacos",
 				Address:  "127.0.0.1:8848",
@@ -131,15 +122,13 @@ func TestResolveFromOutboundRegistryMode(t *testing.T) {
 		Serialization: "protobuf",
 	})
 
-	assert.Equal(t, "registry", spec.Mode)
 	assert.Equal(t, "com.example.UserService", spec.Interface)
-	assert.Equal(t, []string{"nacos-main", "zk"}, spec.RegistryIDs)
-	assert.True(t, spec.UseNacosWarmup)
-	assert.Equal(t, "tri", spec.EffectiveProtocol)
-	assert.Equal(t, "protobuf", spec.EffectiveSerialization)
-	assert.Equal(t, "failover", spec.ConsumerDefaults.Cluster)
-	assert.Equal(t, "3", spec.ConsumerDefaults.Retries)
+	assert.Empty(t, spec.URL)
+	assert.Equal(t, "tri", spec.Protocol)
+	assert.Equal(t, "protobuf", spec.Serialization)
+	assert.Equal(t, "failfast", spec.ConsumerDefaults.Cluster)
 	assert.Equal(t, cst.DefaultReqTimeout, spec.ConsumerDefaults.RequestTimeout)
+	assert.EqualError(t, spec.validate(), "dubbo refer invalid: direct url is required")
 }
 
 func TestPreparePayloadRejectsLengthMismatch(t *testing.T) {
@@ -158,22 +147,19 @@ func TestPreparePayloadRejectsLengthMismatch(t *testing.T) {
 
 func TestCacheKeyIncludesConsumerDefaults(t *testing.T) {
 	baseSpec := resolvedReferSpec{
-		Mode:                   "direct",
-		Interface:              "com.example.UserService",
-		URL:                    "dubbo://127.0.0.1:20880",
-		EffectiveProtocol:      "dubbo",
-		EffectiveSerialization: "hessian2",
+		Interface:     "com.example.UserService",
+		URL:           "dubbo://127.0.0.1:20880",
+		Protocol:      "dubbo",
+		Serialization: "hessian2",
 		ConsumerDefaults: resolvedConsumerDefaults{
-			Cluster:        "failover",
+			Cluster:        "failfast",
 			LoadBalance:    "roundrobin",
-			Retries:        "3",
 			RequestTimeout: time.Second,
 		},
 	}
 
 	changedSpec := baseSpec
 	changedSpec.ConsumerDefaults.LoadBalance = "random"
-	changedSpec.ConsumerDefaults.Retries = "5"
 	changedSpec.ConsumerDefaults.RequestTimeout = 2 * time.Second
 
 	baseKey, err := baseSpec.cacheKey()
@@ -186,8 +172,29 @@ func TestCacheKeyIncludesConsumerDefaults(t *testing.T) {
 	var decoded genericServiceKey
 	require.NoError(t, json.Unmarshal([]byte(changedKey), &decoded))
 	assert.Equal(t, "random", decoded.LoadBalance)
-	assert.Equal(t, "5", decoded.Retries)
 	assert.Equal(t, "2s", decoded.RequestTimeout)
+}
+
+func TestCacheKeyExcludesRegistryModeAndRetries(t *testing.T) {
+	spec := resolvedReferSpec{
+		Interface:     "com.example.UserService",
+		URL:           "dubbo://127.0.0.1:20880",
+		Protocol:      "dubbo",
+		Serialization: "hessian2",
+		ConsumerDefaults: resolvedConsumerDefaults{
+			Cluster:        "failfast",
+			LoadBalance:    "roundrobin",
+			RequestTimeout: time.Second,
+		},
+	}
+
+	key, err := spec.cacheKey()
+	require.NoError(t, err)
+
+	assert.NotContains(t, key, "registry")
+	assert.NotContains(t, key, "registry_ids")
+	assert.NotContains(t, key, "retries")
+	assert.NotContains(t, key, "mode")
 }
 
 func TestCallUsesOutboundOnly(t *testing.T) {

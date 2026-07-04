@@ -77,10 +77,9 @@ static_resources:
 
 We should configure the `dgp.filter.http.dubboproxy` filter in the configuration file.
 
-Do not set `dubboProxyConfig.auto_resolve`. This legacy field has been removed
-and Pixiu now rejects configurations that still contain it. Define the target
-backend with `integrationRequest.requestType`, `interface`, `method`, and related
-Dubbo fields in the API configuration.
+Do not set `dubboProxyConfig.auto_resolve`. This legacy field has been removed.
+Define the target backend with `integrationRequest.requestType`, `interface`,
+`method`, and related Dubbo fields in the API configuration.
 
 ## Test
 

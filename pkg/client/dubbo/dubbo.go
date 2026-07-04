@@ -20,8 +20,6 @@ package dubbo
 import (
 	"context"
 	"encoding/json"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,8 +48,6 @@ import (
 )
 
 const (
-	defaultDubboProtocol = "zookeeper"
-
 	traceNameDubbogoClient = "dubbogo-client"
 	spanNameDubbogoClient  = "DUBBOGO CLIENT"
 
@@ -77,43 +73,35 @@ type Client struct {
 	lock               sync.RWMutex
 	GenericServicePool map[string]*generic.GenericService
 	dubboProxyConfig   *DubboProxyConfig
-	registries         map[string]*global.RegistryConfig
 	dubboClient        *dclient.Client
 }
 
 type resolvedConsumerDefaults struct {
 	Cluster        string
 	LoadBalance    string
-	Retries        string
 	RequestTimeout time.Duration
 }
 
 type resolvedReferSpec struct {
-	Mode                   string
-	Interface              string
-	Group                  string
-	Version                string
-	URL                    string
-	RegistryIDs            []string
-	EffectiveProtocol      string
-	EffectiveSerialization string
-	UseNacosWarmup         bool
-	ConsumerDefaults       resolvedConsumerDefaults
+	Interface        string
+	Group            string
+	Version          string
+	URL              string
+	Protocol         string
+	Serialization    string
+	ConsumerDefaults resolvedConsumerDefaults
 }
 
 type genericServiceKey struct {
-	Mode              string   `json:"mode"`
-	URL               string   `json:"url"`
-	RegistryIDs       []string `json:"registry_ids"`
-	Cluster           string   `json:"cluster"`
-	LoadBalance       string   `json:"load_balance"`
-	Retries           string   `json:"retries"`
-	RequestTimeout    string   `json:"request_timeout"`
-	Interface         string   `json:"interface"`
-	Version           string   `json:"version"`
-	Group             string   `json:"group"`
-	EffectiveProtocol string   `json:"effective_protocol"`
-	Serialization     string   `json:"serialization"`
+	URL            string `json:"url"`
+	Cluster        string `json:"cluster"`
+	LoadBalance    string `json:"load_balance"`
+	RequestTimeout string `json:"request_timeout"`
+	Interface      string `json:"interface"`
+	Version        string `json:"version"`
+	Group          string `json:"group"`
+	Protocol       string `json:"protocol"`
+	Serialization  string `json:"serialization"`
 }
 
 // SingletonDubboClient singleton dubbo clent
@@ -151,33 +139,9 @@ func (dc *Client) SetConfig(dpc *DubboProxyConfig) {
 
 // Apply init dubbo, config mapping can do here
 func (dc *Client) Apply() error {
-	// Build registry configurations
-	registries := make(map[string]*global.RegistryConfig)
-	if dc.dubboProxyConfig != nil && dc.dubboProxyConfig.Registries != nil {
-		for k, v := range dc.dubboProxyConfig.Registries {
-			if len(v.Protocol) == 0 {
-				logger.Warnf("can not find registry protocol config, use default type 'zookeeper'")
-				v.Protocol = defaultDubboProtocol
-			}
-			registries[k] = &global.RegistryConfig{
-				Protocol:     v.Protocol,
-				Address:      v.Address,
-				Timeout:      v.Timeout,
-				Username:     v.Username,
-				Password:     v.Password,
-				Namespace:    v.Namespace,
-				Group:        v.Group,
-				RegistryType: v.RegistryType,
-			}
-		}
-	}
-	dc.registries = registries
-
-	// Create dubbo client with registries and application config
 	var err error
 	dc.dubboClient, err = dclient.NewClient(
 		dclient.SetClientApplication(defaultApplication),
-		dclient.SetClientRegistries(registries),
 	)
 	if err != nil {
 		return err
@@ -243,40 +207,23 @@ func (dc *Client) Call(ctx context.Context, req *DubboOutboundRequest) (any, err
 
 func (dc *Client) resolveFromOutbound(req *DubboOutboundRequest) resolvedReferSpec {
 	spec := resolvedReferSpec{
-		Interface:              req.Service,
-		Group:                  req.Group,
-		Version:                req.Version,
-		EffectiveProtocol:      req.Protocol,
-		EffectiveSerialization: req.Serialization,
-		ConsumerDefaults:       dc.resolveGlobalConsumerDefaults(),
+		Interface:        req.Service,
+		Group:            req.Group,
+		Version:          req.Version,
+		Protocol:         req.Protocol,
+		Serialization:    req.Serialization,
+		ConsumerDefaults: dc.resolveGlobalConsumerDefaults(),
 	}
 
 	if strings.TrimSpace(req.Address) != "" {
-		spec.Mode = "direct"
 		spec.URL = req.Protocol + "://" + req.Address
-		return spec
 	}
-
-	registryIDs := make([]string, 0, len(dc.registries))
-	useNacosWarmup := false
-	for id, registry := range dc.registries {
-		registryIDs = append(registryIDs, id)
-		if registry != nil && registry.Protocol == "nacos" {
-			useNacosWarmup = true
-		}
-	}
-	sort.Strings(registryIDs)
-
-	spec.Mode = "registry"
-	spec.RegistryIDs = registryIDs
-	spec.UseNacosWarmup = useNacosWarmup
 	return spec
 }
 
 func (dc *Client) resolveGlobalConsumerDefaults() resolvedConsumerDefaults {
 	defaults := resolvedConsumerDefaults{
-		Cluster:        "failover",
-		Retries:        "3",
+		Cluster:        "failfast",
 		RequestTimeout: cst.DefaultReqTimeout,
 	}
 
@@ -285,9 +232,6 @@ func (dc *Client) resolveGlobalConsumerDefaults() resolvedConsumerDefaults {
 	}
 
 	defaults.LoadBalance = dc.dubboProxyConfig.LoadBalance
-	if strings.TrimSpace(dc.dubboProxyConfig.Retries) != "" {
-		defaults.Retries = strings.TrimSpace(dc.dubboProxyConfig.Retries)
-	}
 	if dc.dubboProxyConfig.Timeout != nil {
 		if timeout, err := time.ParseDuration(dc.dubboProxyConfig.Timeout.RequestTimeoutStr); err == nil {
 			defaults.RequestTimeout = timeout
@@ -365,20 +309,19 @@ func (dc *Client) check(key string) bool {
 }
 
 func (spec resolvedReferSpec) validate() error {
-	switch spec.Mode {
-	case "registry":
-		if len(spec.RegistryIDs) == 0 {
-			return errors.New("dubbo refer mode invalid: registry mode requires registry ids")
-		}
-		return nil
-	case "direct":
-		if strings.TrimSpace(spec.URL) == "" {
-			return errors.New("dubbo refer mode invalid: direct mode requires direct url")
-		}
-		return nil
-	default:
-		return errors.Errorf("dubbo refer mode invalid: %s", spec.Mode)
+	if strings.TrimSpace(spec.Interface) == "" {
+		return errors.New("dubbo refer invalid: interface is required")
 	}
+	if strings.TrimSpace(spec.URL) == "" {
+		return errors.New("dubbo refer invalid: direct url is required")
+	}
+	if strings.TrimSpace(spec.Protocol) == "" {
+		return errors.New("dubbo refer invalid: protocol is required")
+	}
+	if strings.TrimSpace(spec.Serialization) == "" {
+		return errors.New("dubbo refer invalid: serialization is required")
+	}
+	return nil
 }
 
 func (spec resolvedReferSpec) cacheKey() (string, error) {
@@ -396,21 +339,16 @@ func (spec resolvedReferSpec) cacheKey() (string, error) {
 
 func (spec resolvedReferSpec) genericServiceKey() genericServiceKey {
 	// Cache key includes all fields that affect reference creation.
-	registryIDs := append([]string(nil), spec.RegistryIDs...)
-	sort.Strings(registryIDs)
 	return genericServiceKey{
-		Mode:              spec.Mode,
-		URL:               spec.URL,
-		RegistryIDs:       registryIDs,
-		Cluster:           spec.ConsumerDefaults.Cluster,
-		LoadBalance:       spec.ConsumerDefaults.LoadBalance,
-		Retries:           spec.ConsumerDefaults.Retries,
-		RequestTimeout:    spec.ConsumerDefaults.RequestTimeout.String(),
-		Interface:         spec.Interface,
-		Version:           spec.Version,
-		Group:             spec.Group,
-		EffectiveProtocol: spec.EffectiveProtocol,
-		Serialization:     spec.EffectiveSerialization,
+		URL:            spec.URL,
+		Cluster:        spec.ConsumerDefaults.Cluster,
+		LoadBalance:    spec.ConsumerDefaults.LoadBalance,
+		RequestTimeout: spec.ConsumerDefaults.RequestTimeout.String(),
+		Interface:      spec.Interface,
+		Version:        spec.Version,
+		Group:          spec.Group,
+		Protocol:       spec.Protocol,
+		Serialization:  spec.Serialization,
 	}
 }
 
@@ -458,10 +396,6 @@ func (dc *Client) create(spec resolvedReferSpec) (*generic.GenericService, error
 		return nil, err
 	}
 
-	if spec.Mode == "registry" && spec.UseNacosWarmup {
-		time.Sleep(time.Second)
-	}
-
 	dc.GenericServicePool[key] = clientService
 
 	return clientService, nil
@@ -472,8 +406,8 @@ func (dc *Client) buildReferenceOptions(spec resolvedReferSpec) ([]dclient.Refer
 	if err := spec.validate(); err != nil {
 		return nil, err
 	}
-	if strings.TrimSpace(spec.EffectiveProtocol) == "" {
-		return nil, errors.New("dubbo refer mode invalid: effective protocol is required")
+	if strings.TrimSpace(spec.Protocol) == "" {
+		return nil, errors.New("dubbo refer invalid: protocol is required")
 	}
 
 	defaults := spec.ConsumerDefaults
@@ -487,25 +421,16 @@ func (dc *Client) buildReferenceOptions(spec resolvedReferSpec) ([]dclient.Refer
 		opts = append(opts, dclient.WithVersion(spec.Version))
 	}
 
-	// Mode selects either registry discovery or a direct provider URL.
-	opts = appendModeReferenceOptions(opts, spec)
+	opts = append(opts, dclient.WithURL(spec.URL))
 	opts = append(opts, clusterReferenceOption(defaults.Cluster))
-	opts = append(opts, protocolReferenceOption(spec.EffectiveProtocol))
-	if spec.EffectiveSerialization != "" {
-		opts = append(opts, dclient.WithSerialization(spec.EffectiveSerialization))
+	opts = append(opts, protocolReferenceOption(spec.Protocol))
+	if spec.Serialization != "" {
+		opts = append(opts, dclient.WithSerialization(spec.Serialization))
 	}
 
 	if loadBalanceOpt := loadBalanceReferenceOption(defaults.LoadBalance); loadBalanceOpt != nil {
 		opts = append(opts, loadBalanceOpt)
 	}
-
-	retries := 3
-	if strings.TrimSpace(defaults.Retries) != "" {
-		if resolvedRetries, err := strconv.Atoi(defaults.Retries); err == nil {
-			retries = resolvedRetries
-		}
-	}
-	opts = append(opts, dclient.WithRetries(retries))
 
 	timeout := defaults.RequestTimeout
 	if timeout <= 0 {
@@ -516,19 +441,6 @@ func (dc *Client) buildReferenceOptions(spec resolvedReferSpec) ([]dclient.Refer
 	opts = append(opts, dclient.WithGeneric())
 
 	return opts, nil
-}
-
-func appendModeReferenceOptions(opts []dclient.ReferenceOption, spec resolvedReferSpec) []dclient.ReferenceOption {
-	switch spec.Mode {
-	case "registry":
-		registryIDs := append([]string(nil), spec.RegistryIDs...)
-		sort.Strings(registryIDs)
-		return append(opts, dclient.WithRegistryIDs(registryIDs...))
-	case "direct":
-		return append(opts, dclient.WithURL(spec.URL))
-	default:
-		return opts
-	}
 }
 
 func clusterReferenceOption(cluster string) dclient.ReferenceOption {

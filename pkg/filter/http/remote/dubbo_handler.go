@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,12 +35,21 @@ import (
 	clientdubbo "github.com/apache/dubbo-go-pixiu/pkg/client/dubbo"
 	"github.com/apache/dubbo-go-pixiu/pkg/common/constant"
 	"github.com/apache/dubbo-go-pixiu/pkg/config"
+	"github.com/apache/dubbo-go-pixiu/pkg/model"
 	"github.com/apache/dubbo-go-pixiu/pkg/router"
 )
 
 var mapSourcePattern = regexp.MustCompile(`^(uri|queryStrings|headers|requestBody)\.([\w\d.-]+)$`)
 
 type DubboHandler struct{}
+
+const (
+	dubboEndpointMetadataInterface     = "interface"
+	dubboEndpointMetadataGroup         = "group"
+	dubboEndpointMetadataVersion       = "version"
+	dubboEndpointMetadataProtocol      = "protocol"
+	dubboEndpointMetadataSerialization = "serialization"
+)
 
 type outboundBuildState struct {
 	service       string
@@ -59,8 +67,8 @@ type outboundBuildState struct {
 	body          map[string]any
 }
 
-func (h *DubboHandler) BuildOutbound(req *http.Request, api router.API) (*clientdubbo.DubboOutboundRequest, error) {
-	state, err := h.newState(req, api)
+func (h *DubboHandler) BuildOutbound(req *http.Request, api router.API, endpoint *model.Endpoint) (*clientdubbo.DubboOutboundRequest, error) {
+	state, err := h.newState(req, api, endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -72,9 +80,6 @@ func (h *DubboHandler) BuildOutbound(req *http.Request, api router.API) (*client
 		}
 	}
 
-	if err := h.finalizeDirectAddress(state, api.IntegrationRequest); err != nil {
-		return nil, err
-	}
 	if err := h.finalizeArgumentsAndTypes(state, api.IntegrationRequest); err != nil {
 		return nil, err
 	}
@@ -92,7 +97,7 @@ func (h *DubboHandler) BuildOutbound(req *http.Request, api router.API) (*client
 	}, nil
 }
 
-func (h *DubboHandler) newState(req *http.Request, api router.API) (*outboundBuildState, error) {
+func (h *DubboHandler) newState(req *http.Request, api router.API, endpoint *model.Endpoint) (*outboundBuildState, error) {
 	body := map[string]any{}
 	if req != nil && req.Body != nil {
 		rawBody, err := io.ReadAll(req.Body)
@@ -108,26 +113,62 @@ func (h *DubboHandler) newState(req *http.Request, api router.API) (*outboundBui
 		}
 	}
 
+	if endpoint == nil {
+		return nil, errors.New("dubbo endpoint is required")
+	}
+	metadata := endpoint.Metadata
+	service := strings.TrimSpace(metadata[dubboEndpointMetadataInterface])
+	protocol := clientdubbo.NormalizeReferenceProtocol(metadata[dubboEndpointMetadataProtocol])
+	serialization := strings.TrimSpace(metadata[dubboEndpointMetadataSerialization])
+	address := endpointAddress(endpoint)
+
 	ir := api.IntegrationRequest
-	return &outboundBuildState{
-		service:       ir.Interface,
-		method:        ir.Method,
-		group:         ir.Group,
-		version:       ir.Version,
-		protocol:      h.resolveDeclaredProtocol(ir),
-		serialization: strings.TrimSpace(ir.Serialization),
+	state := &outboundBuildState{
+		service:       service,
+		method:        strings.TrimSpace(ir.Method),
+		group:         strings.TrimSpace(metadata[dubboEndpointMetadataGroup]),
+		version:       strings.TrimSpace(metadata[dubboEndpointMetadataVersion]),
+		address:       address,
+		protocol:      protocol,
+		serialization: serialization,
 		body:          body,
-	}, nil
+	}
+	if err := h.validateEndpointTarget(state); err != nil {
+		return nil, err
+	}
+	return state, nil
 }
 
-func (h *DubboHandler) resolveDeclaredProtocol(ir config.IntegrationRequest) string {
-	if protocol := clientdubbo.NormalizeReferenceProtocol(ir.Protocol); protocol != "" {
-		return protocol
+func endpointAddress(endpoint *model.Endpoint) string {
+	if endpoint == nil {
+		return ""
 	}
-	if protocol := clientdubbo.NormalizeReferenceProtocol(ir.RequestType); protocol != "" {
-		return protocol
+	if len(endpoint.Address.Domains) > 0 {
+		return strings.TrimSpace(endpoint.Address.Domains[0])
 	}
-	return "dubbo"
+	if strings.TrimSpace(endpoint.Address.Address) == "" || endpoint.Address.Port <= 0 {
+		return ""
+	}
+	return strings.TrimSpace(endpoint.Address.GetAddress())
+}
+
+func (h *DubboHandler) validateEndpointTarget(state *outboundBuildState) error {
+	if state.address == "" {
+		return errors.New("dubbo endpoint address is required")
+	}
+	if state.service == "" {
+		return errors.New("dubbo endpoint metadata interface is required")
+	}
+	if state.protocol == "" {
+		return errors.New("dubbo endpoint metadata protocol is required")
+	}
+	if state.serialization == "" {
+		return errors.New("dubbo endpoint metadata serialization is required")
+	}
+	if state.method == "" {
+		return errors.New("dubbo api method is required")
+	}
+	return nil
 }
 
 func (h *DubboHandler) applyMapping(state *outboundBuildState, req *http.Request, api router.API, mp config.MappingParam) error {
@@ -184,14 +225,6 @@ func (h *DubboHandler) readSourceValue(state *outboundBuildState, req *http.Requ
 func (h *DubboHandler) applyOptMapping(state *outboundBuildState, mapTo string, value any, mapType string) error {
 	optKey := strings.TrimSpace(strings.TrimPrefix(mapTo, "opt."))
 	switch optKey {
-	case "group":
-		return applyStringOptValue(&state.group, "Group", value)
-	case "version":
-		return applyStringOptValue(&state.version, "Version", value)
-	case "interface":
-		return applyStringOptValue(&state.service, "Interface", value)
-	case "method":
-		return applyStringOptValue(&state.method, "Method", value)
 	case "values":
 		values, err := h.normalizeOptValues(value)
 		if err != nil {
@@ -213,20 +246,9 @@ func (h *DubboHandler) applyOptMapping(state *outboundBuildState, mapTo string, 
 		}
 		state.optTypes = types
 		return nil
-	case "application":
-		return errors.Errorf("deprecated opt mapping: %s", mapTo)
 	default:
-		return errors.Errorf("unknown opt mapping: %s", mapTo)
+		return errors.Errorf("unsupported opt mapping for dubbo generic invocation: %s", mapTo)
 	}
-}
-
-func applyStringOptValue(target *string, name string, value any) error {
-	v, ok := value.(string)
-	if !ok {
-		return errors.Errorf("%s value is not string", name)
-	}
-	*target = v
-	return nil
 }
 
 func (h *DubboHandler) parseMapSource(source string) (string, []string, error) {
@@ -354,43 +376,6 @@ func (h *DubboHandler) normalizeOptValues(value any) ([]any, error) {
 	}
 }
 
-func (h *DubboHandler) finalizeDirectAddress(state *outboundBuildState, ir config.IntegrationRequest) error {
-	rawURL := strings.TrimSpace(ir.URL)
-	if rawURL == "" {
-		return nil
-	}
-	if state.serialization == "" {
-		return errors.New("direct generic invoke requires serialization")
-	}
-
-	if !strings.Contains(rawURL, "://") {
-		if state.protocol == "" {
-			return errors.New("direct generic invoke requires protocol")
-		}
-		state.address = rawURL
-		return nil
-	}
-
-	// Direct URLs bypass registry lookup and must match the declared protocol.
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return err
-	}
-
-	directProtocol, err := clientdubbo.DirectURLProtocol(rawURL)
-	if err != nil {
-		return err
-	}
-	declaredProtocol := clientdubbo.NormalizeReferenceProtocol(ir.Protocol)
-	if declaredProtocol != "" && declaredProtocol != directProtocol {
-		return errors.Errorf("direct protocol mismatch: url=%s protocol=%s", directProtocol, declaredProtocol)
-	}
-
-	state.protocol = directProtocol
-	state.address = u.Host
-	return nil
-}
-
 func (h *DubboHandler) finalizeArgumentsAndTypes(state *outboundBuildState, ir config.IntegrationRequest) error {
 	if state.hasPositional && state.optValues != nil {
 		return errors.New("positional mappings and opt.values are mutually exclusive")
@@ -408,31 +393,25 @@ func (h *DubboHandler) finalizeArgumentsAndTypes(state *outboundBuildState, ir c
 		state.paramTypes = append([]string(nil), state.optTypes...)
 		return h.coerceDeclaredArguments(state)
 	}
-	if strings.TrimSpace(ir.URL) != "" {
-		return errors.New("direct generic invoke requires parameterTypes")
+	if len(state.arguments) == 0 {
+		state.paramTypes = []string{}
+		return nil
 	}
-
-	// Registry mode keeps the historical behavior of inferring omitted Java types.
-	inferred := clientdubbo.InferJavaClassNames(state.arguments)
-	if len(inferred) < len(state.arguments) {
-		inferred = append(inferred, make([]string, len(state.arguments)-len(inferred))...)
-	}
-
-	paramTypes := make([]string, len(state.arguments))
-	for i := range state.arguments {
-		if i < len(state.paramTypes) && strings.TrimSpace(state.paramTypes[i]) != "" {
-			paramTypes[i] = strings.TrimSpace(state.paramTypes[i])
-			continue
+	if len(state.paramTypes) == len(state.arguments) {
+		for i := range state.paramTypes {
+			if strings.TrimSpace(state.paramTypes[i]) == "" {
+				return errors.New("dubbo generic invoke requires parameterTypes")
+			}
+			state.paramTypes[i] = strings.TrimSpace(state.paramTypes[i])
 		}
-		paramTypes[i] = inferred[i]
+		return h.coerceDeclaredArguments(state)
 	}
-	state.paramTypes = paramTypes
-	return nil
+	return errors.New("dubbo generic invoke requires parameterTypes")
 }
 
 func (h *DubboHandler) coerceDeclaredArguments(state *outboundBuildState) error {
 	if len(state.arguments) != len(state.paramTypes) {
-		return errors.New("direct generic invoke requires values to match parameterTypes")
+		return errors.New("dubbo generic invoke requires values to match parameterTypes")
 	}
 
 	values := make([]any, len(state.arguments))

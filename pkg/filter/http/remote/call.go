@@ -33,7 +33,9 @@ import (
 	"github.com/apache/dubbo-go-pixiu/pkg/common/extension/filter"
 	contexthttp "github.com/apache/dubbo-go-pixiu/pkg/context/http"
 	"github.com/apache/dubbo-go-pixiu/pkg/logger"
+	"github.com/apache/dubbo-go-pixiu/pkg/model"
 	"github.com/apache/dubbo-go-pixiu/pkg/router"
+	"github.com/apache/dubbo-go-pixiu/pkg/server"
 )
 
 const (
@@ -65,8 +67,13 @@ type (
 	}
 
 	Filter struct {
-		conf        filterConfig
-		dubboClient dubbo.DubboClient
+		conf           filterConfig
+		dubboClient    dubbo.DubboClient
+		clusterManager endpointPicker
+	}
+
+	endpointPicker interface {
+		PickEndpoint(clusterName string, policy model.LbPolicy) *model.Endpoint
 	}
 
 	filterConfig struct {
@@ -105,21 +112,15 @@ func (factory *FilterFactory) Apply() error {
 		level = CLOSE
 	}
 	factory.conf.Level = level
-	// must init it at apply function
-	if factory.conf.DubboProxyConfig == nil {
-		return errors.New("expect the dubboProxyConfig config the registries")
-	}
-	if factory.conf.DubboProxyConfig.AutoResolve != nil {
-		return errors.New("dubboProxyConfig.auto_resolve is no longer supported; remove it and configure integrationRequest explicitly in the API definition")
-	}
 	initDubboClient(factory.conf.DubboProxyConfig)
 	return nil
 }
 
 func (factory *FilterFactory) PrepareFilterChain(ctx *contexthttp.HttpContext, chain filter.FilterChain) error {
 	f := &Filter{
-		conf:        *factory.conf,
-		dubboClient: dubbo.SingletonDubboClient(),
+		conf:           *factory.conf,
+		dubboClient:    dubbo.SingletonDubboClient(),
+		clusterManager: defaultEndpointPicker(),
 	}
 	chain.AppendDecodeFilters(f)
 	return nil
@@ -164,8 +165,33 @@ func (f *Filter) callHTTP(c *contexthttp.HttpContext, api router.API) filter.Fil
 }
 
 func (f *Filter) callDubbo(c *contexthttp.HttpContext, api router.API) filter.FilterStatus {
+	rEntry := c.GetRouteEntry()
+	if rEntry == nil {
+		return f.handleClientError(c, errors.New("dubbo route cluster is required"))
+	}
+
+	clusterName := strings.TrimSpace(rEntry.Cluster)
+	if clusterName == "" {
+		return f.handleClientError(c, errors.New("dubbo route cluster is required"))
+	}
+
+	clusterManager := f.clusterManager
+	if clusterManager == nil {
+		clusterManager = defaultEndpointPicker()
+	}
+	if clusterManager == nil {
+		return f.handleClientError(c, errors.New("cluster manager is not initialized"))
+	}
+	endpoint := clusterManager.PickEndpoint(clusterName, c)
+	if endpoint == nil {
+		logger.Debugf("[dubbo-go-pixiu] cluster not found endpoint")
+		errResp := contexthttp.ServiceUnavailable.WithError(errors.New("endpoint not found"))
+		c.SendLocalReply(errResp.Status, errResp.ToJSON())
+		return filter.Stop
+	}
+
 	// BuildOutbound keeps HTTP mapping details out of the Dubbo client.
-	outbound, err := (&DubboHandler{}).BuildOutbound(c.Request, api)
+	outbound, err := (&DubboHandler{}).BuildOutbound(c.Request, api, endpoint)
 	if err != nil {
 		return f.handleClientError(c, err)
 	}
@@ -201,4 +227,12 @@ func (f *Filter) matchHTTPClient(typ string) (client.Client, error) {
 	default:
 		return nil, errors.New("not support")
 	}
+}
+
+func defaultEndpointPicker() endpointPicker {
+	srv := server.GetServer()
+	if srv == nil {
+		return nil
+	}
+	return srv.GetClusterManager()
 }
