@@ -137,13 +137,13 @@ func (n *nacosAppListener) updateServiceList(serviceList []string) error {
 	for _, v := range serviceList {
 		appInfo := fromServiceKey(v)
 		if appInfo == nil {
-			// ignore interface registry
+			logger.Warnf("skip nacos service %s because service discovery ignores interface registry entries", v)
 			continue
 		}
 		key := appInfo.String()
 		newServiceMap[key] = struct{}{}
 		if _, ok := n.appInfoMap[key]; !ok {
-			l := newNacosAppSrvListener(n.client, n.adapterListener)
+			l := newNacosAppSrvListener(n.client, n.adapterListener, n.regConf.ID, appInfo.appName)
 			l.wg.Add(1)
 
 			appInfo.listener = l

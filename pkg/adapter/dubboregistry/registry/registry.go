@@ -37,6 +37,9 @@ import (
 	"github.com/apache/dubbo-go-pixiu/pkg/router"
 )
 
+// RegisteredType selects the internal listener family used by registry
+// implementations. The "application" name is a legacy internal listener type;
+// Nacos registry-type config values are parsed separately in the Nacos package.
 type RegisteredType int8
 
 var RegisteredTypes = []string{"application", "interface"}
@@ -86,6 +89,7 @@ func GetRegistry(name string, regConfig model.Registry, listener common2.Registr
 		reg, err := registry(regConfig, listener)
 		if err != nil {
 			logger.Warnf("Initialize Registry %s failed due to: %s", name, err.Error())
+			return nil, err
 		}
 		return reg, nil
 	}

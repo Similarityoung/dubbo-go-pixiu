@@ -32,6 +32,7 @@ import (
 	baseRegistry "github.com/apache/dubbo-go-pixiu/pkg/adapter/dubboregistry/registry/base"
 	"github.com/apache/dubbo-go-pixiu/pkg/common/constant"
 	"github.com/apache/dubbo-go-pixiu/pkg/common/util/stringutil"
+	"github.com/apache/dubbo-go-pixiu/pkg/logger"
 	"github.com/apache/dubbo-go-pixiu/pkg/model"
 )
 
@@ -43,6 +44,31 @@ type NacosRegistry struct {
 	*baseRegistry.BaseRegistry
 	nacosListeners map[registry.RegisteredType]registry.Listener
 	client         naming_client.INamingClient
+}
+
+type nacosRegistryMode string
+
+const (
+	nacosRegistryTypeDefault     = ""
+	nacosRegistryTypeService     = "service"
+	nacosRegistryTypeAll         = "all"
+	nacosRegistryTypeInterface   = registry.RegisteredTypeInterfaceName
+	nacosRegistryTypeApplication = registry.RegisteredTypeApplicationName
+
+	modeService nacosRegistryMode = nacosRegistryTypeService
+)
+
+func parseNacosRegistryMode(s string) (nacosRegistryMode, error) {
+	switch s {
+	case nacosRegistryTypeDefault, nacosRegistryTypeService, nacosRegistryTypeAll:
+		return modeService, nil
+	case nacosRegistryTypeInterface:
+		return "", errors.Errorf("registry-type %s is not supported in this release", nacosRegistryTypeInterface)
+	case nacosRegistryTypeApplication:
+		return "", errors.Errorf("registry-type %s is not valid; use %s", nacosRegistryTypeApplication, nacosRegistryTypeService)
+	default:
+		return "", errors.Errorf("unknown registry-type %q", s)
+	}
 }
 
 func (n *NacosRegistry) DoSubscribe() error {
@@ -61,6 +87,11 @@ func (n *NacosRegistry) DoUnsubscribe() error {
 var _ registry.Registry = new(NacosRegistry)
 
 func newNacosRegistry(regConfig model.Registry, adapterListener common.RegistryEventListener) (registry.Registry, error) {
+	mode, err := parseNacosRegistryMode(regConfig.RegistryType)
+	if err != nil {
+		return nil, err
+	}
+
 	addrs, err := stringutil.GetIPAndPort(regConfig.Address)
 	if err != nil {
 		return nil, err
@@ -92,14 +123,15 @@ func newNacosRegistry(regConfig model.Registry, adapterListener common.RegistryE
 		client:         client,
 		nacosListeners: make(map[registry.RegisteredType]registry.Listener),
 	}
-	nacosRegistry.BaseRegistry = baseRegistry.NewBaseRegistry(nacosRegistry, adapterListener, registry.RegisterTypeFromName(regConfig.RegistryType))
-	switch nacosRegistry.RegisteredType {
-	case registry.RegisteredTypeInterface:
-		nacosRegistry.nacosListeners[nacosRegistry.RegisteredType] = newNacosIntfListener(client, nacosRegistry, &regConfig, adapterListener)
-	case registry.RegisteredTypeApplication:
+	nacosRegistry.BaseRegistry = baseRegistry.NewBaseRegistry(nacosRegistry, adapterListener, registry.RegisteredTypeApplication)
+	switch mode {
+	case modeService:
+		if regConfig.RegistryType == nacosRegistryTypeAll {
+			logger.Infof("nacos registry-type %s is handled as service discovery", nacosRegistryTypeAll)
+		}
 		nacosRegistry.nacosListeners[nacosRegistry.RegisteredType] = newNacosAppListener(client, nacosRegistry, &regConfig, adapterListener)
 	default:
-		return nil, errors.Errorf("Unsupported registry type: %s", regConfig.RegistryType)
+		return nil, errors.Errorf("unsupported nacos registry mode %s", mode)
 	}
 	return nacosRegistry, nil
 }

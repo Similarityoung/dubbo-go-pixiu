@@ -217,6 +217,7 @@ func generateInstance(ss nacosModel.SubscribeService) nacosModel.Instance {
 		ServiceName: ss.ServiceName,
 		Valid:       ss.Valid,
 		Enable:      ss.Enable,
+		Healthy:     ss.Healthy,
 		Weight:      ss.Weight,
 		Metadata:    ss.Metadata,
 		ClusterName: ss.ClusterName,
